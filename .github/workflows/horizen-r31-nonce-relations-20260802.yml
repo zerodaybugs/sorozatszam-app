@@ -1,0 +1,39 @@
+name: Horizen R31 public read-only nonce-relation gate
+
+on:
+  push:
+    branches:
+      - ci/horizen-r31-nonce-relations-20260802
+    paths:
+      - '.github/workflows/horizen-r31-nonce-relations-20260802.yml'
+      - 'scripts/horizen_r31_nonce_relation_gate.py'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/horizen-r31-nonce-relations-20260802.yml'
+      - 'scripts/horizen_r31_nonce_relation_gate.py'
+
+permissions:
+  contents: read
+
+jobs:
+  nonce-relations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Install pinned elliptic-curve dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir coincurve==21.0.0
+      - name: Analyze complete public sender history
+        run: python3 scripts/horizen_r31_nonce_relation_gate.py
+      - name: Upload read-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-r31-nonce-relation-gate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
