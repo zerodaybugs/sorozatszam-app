@@ -1,0 +1,53 @@
+name: Binance P2P Merge Probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/binance-p2p-merge-probe.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch official Binance P2P endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p automation
+          curl --fail --silent --show-error --location --retry 2 --max-time 30 \
+            -H 'Accept: application/json, text/plain, */*' \
+            -H 'User-Agent: Mozilla/5.0 (compatible; ZeroDayBugs-P2P-Monitor/1.0)' \
+            'https://www.binance.com/bapi/c2c/v1/public/c2c/agent/trade-methods?fiat=EUR' \
+            -o automation/binance_p2p_trade_methods.json
+          curl --fail --silent --show-error --location --retry 2 --max-time 30 \
+            -H 'Accept: application/json, text/plain, */*' \
+            -H 'User-Agent: Mozilla/5.0 (compatible; ZeroDayBugs-P2P-Monitor/1.0)' \
+            'https://www.binance.com/bapi/c2c/v1/public/c2c/agent/ad-list?fiat=EUR&asset=USDT&tradeType=SELL&limit=20' \
+            -o automation/binance_p2p_ads.json
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          for path in ('automation/binance_p2p_trade_methods.json','automation/binance_p2p_ads.json'):
+              with open(path,encoding='utf-8') as f:
+                  data=json.load(f)
+              if not isinstance(data,dict):
+                  raise SystemExit(f'invalid JSON object: {path}')
+          with open('automation/binance_p2p_probe_meta.json','w',encoding='utf-8') as f:
+              json.dump({'checkedAtUtc':datetime.now(timezone.utc).isoformat()},f,indent=2)
+              f.write('\n')
+          PY
+      - name: Commit probe evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add automation/binance_p2p_trade_methods.json automation/binance_p2p_ads.json automation/binance_p2p_probe_meta.json
+          git commit -m 'Record Binance P2P API snapshot [skip ci]'
+          git push
