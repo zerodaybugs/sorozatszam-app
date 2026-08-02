@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Reconstruct all deposit liabilities from public state
+      - name: Reconstruct all deposit liabilities from one pinned public block
         shell: bash
         env:
           RPC: https://horizen-testnet.rpc.caldera.xyz/http
@@ -23,49 +23,231 @@ jobs:
           FROM_BLOCK: '21842327'
         run: |
           set -euo pipefail
+          mkdir -p evidence
           python3 - <<'PY'
           import json, os, time, urllib.request
-          RPC=os.environ['RPC']; S=os.environ['STAKER'].lower(); T=os.environ['TOKEN'].lower(); START=int(os.environ['FROM_BLOCK']); SCALE=10**36
-          rid=0
-          def rpc(method,params,tries=4):
+
+          RPC = os.environ['RPC']
+          S = os.environ['STAKER'].lower()
+          T = os.environ['TOKEN'].lower()
+          START = int(os.environ['FROM_BLOCK'])
+          SCALE = 10**36
+          rid = 0
+
+          def rpc(method, params, tries=4):
               global rid
-              last=None
+              last = None
               for n in range(tries):
-                  rid+=1; body=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode(); req=urllib.request.Request(RPC,data=body,headers={'content-type':'application/json','user-agent':'Horizen-R30-exact-liability'},method='POST')
+                  rid += 1
+                  body = json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode()
+                  req = urllib.request.Request(
+                      RPC,
+                      data=body,
+                      headers={'content-type':'application/json','user-agent':'Horizen-R30-exact-liability/2'},
+                      method='POST',
+                  )
                   try:
-                      with urllib.request.urlopen(req,timeout=40) as r: out=json.loads(r.read())
-                      if 'error' in out: raise RuntimeError(out['error'])
+                      with urllib.request.urlopen(req, timeout=40) as response:
+                          out = json.loads(response.read())
+                      if 'error' in out:
+                          raise RuntimeError(out['error'])
                       return out['result']
-                  except Exception as e: last=e; time.sleep(2**n)
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2**n)
               raise RuntimeError(f'{method}: {last}')
-          def call(to,data): return rpc('eth_call',[{'to':to,'data':data},'latest'])
-          def ui(x): return int(x,16)
-          def pad(v): return hex(v)[2:].rjust(64,'0')
-          def words(x):
-              h=x[2:]; assert len(h)%64==0
-              return [h[i:i+64] for i in range(0,len(h),64)]
-          def logs(address,topic,start,end,chunk=20000):
-              out=[]; cur=start
-              while cur<=end:
-                  stop=min(cur+chunk-1,end)
-                  try: out+=rpc('eth_getLogs',[{'address':address,'fromBlock':hex(cur),'toBlock':hex(stop),'topics':[topic]}],3); cur=stop+1
+
+          def ui(value):
+              return int(value, 16)
+
+          def pad(value):
+              return hex(value)[2:].rjust(64, '0')
+
+          def words(value):
+              raw = value[2:]
+              if len(raw) % 64:
+                  raise ValueError(f'non-word ABI response: {value}')
+              return [raw[i:i+64] for i in range(0, len(raw), 64)]
+
+          latest = ui(rpc('eth_blockNumber', []))
+          block_tag = hex(latest)
+          block = rpc('eth_getBlockByNumber', [block_tag, False])
+          now = ui(block['timestamp'])
+
+          def call(to, data):
+              return rpc('eth_call', [{'to':to, 'data':data}, block_tag])
+
+          def logs(address, topic, start, end, chunk=20_000):
+              out = []
+              cursor = start
+              while cursor <= end:
+                  stop = min(cursor + chunk - 1, end)
+                  try:
+                      out += rpc('eth_getLogs', [{
+                          'address': address,
+                          'fromBlock': hex(cursor),
+                          'toBlock': hex(stop),
+                          'topics': [topic],
+                      }], 3)
+                      cursor = stop + 1
                   except Exception:
-                      if chunk<=500: raise
-                      chunk//=2
+                      if chunk <= 500:
+                          raise
+                      chunk //= 2
               return out
-          SEL={'deposits':'0xb02c43d0','unclaimed':'0xcb3056ad','rpt':'0xae0d27b6','staked':'0x817b1cd2','power':'0x08484dee','end':'0x37e9f64a','rate':'0xc3c16e4e','balance':'0x70a08231'}
-          TOPIC='0x1a325385f16807e99fb688b597db78b00faee313dcf02e882dd16daab6fc3e1f'
-          latest=ui(rpc('eth_blockNumber',[])); now=ui(rpc('eth_getBlockByNumber',[hex(latest),False])['timestamp']); events=logs(S,TOPIC,START,latest); ids=sorted({ui(x['topics'][2]) for x in events})
-          rpt=ui(call(S,SEL['rpt'])); total_staked=ui(call(S,SEL['staked'])); total_power=ui(call(S,SEL['power'])); reward_end=ui(call(S,SEL['end'])); rate=ui(call(S,SEL['rate'])); staker_balance=ui(call(T,SEL['balance']+S[2:].rjust(64,'0')))
-          rows=[]; sum_bal=sum_ep=sum_scaled=sum_floor=0
-          for i in ids:
-              w=words(call(S,SEL['deposits']+pad(i))); assert len(w)>=7
-              bal=ui('0x'+w[0]); owner='0x'+w[1][-40:]; ep=ui('0x'+w[2]); delegatee='0x'+w[3][-40:]; claimer='0x'+w[4][-40:]; checkpoint=ui('0x'+w[5]); stored=ui('0x'+w[6]); assert rpt>=checkpoint
-              exact=stored+ep*(rpt-checkpoint); floor=ui(call(S,SEL['unclaimed']+pad(i))); assert floor==exact//SCALE
-              sum_bal+=bal; sum_ep+=ep; sum_scaled+=exact; sum_floor+=floor
-              rows.append({'id':i,'balance':str(bal),'owner':owner,'earning_power':str(ep),'delegatee':delegatee,'claimer':claimer,'reward_per_token_checkpoint':str(checkpoint),'stored_scaled_unclaimed':str(stored),'exact_scaled_unclaimed':str(exact),'floor_unclaimed_raw':str(floor)})
-          remaining=max(reward_end-now,0); future_scaled=rate*remaining; backing_scaled=staker_balance*SCALE; total_liability=sum_scaled+future_scaled; surplus=backing_scaled-total_liability
-          result={'classification':'PUBLIC_READ_ONLY_EXACT_LIABILITY','public_network_writes':0,'collected_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'block_number':latest,'block_timestamp':now,'stake_event_count':len(events),'unique_deposit_ids':len(ids),'reward_per_token_accumulated':str(rpt),'aggregates':{'sum_deposit_balances':str(sum_bal),'contract_total_staked':str(total_staked),'principal_aggregate_delta':str(sum_bal-total_staked),'sum_deposit_earning_power':str(sum_ep),'contract_total_earning_power':str(total_power),'earning_power_aggregate_delta':str(sum_ep-total_power)},'liability':{'staker_token_balance_raw':str(staker_balance),'staker_backing_scaled':str(backing_scaled),'exact_accrued_scaled':str(sum_scaled),'floor_accrued_raw':str(sum_floor),'reward_end':reward_end,'remaining_seconds':remaining,'scaled_reward_rate':str(rate),'future_stream_scaled':str(future_scaled),'total_accrued_plus_future_scaled':str(total_liability),'exact_surplus_scaled':str(surplus),'exact_surplus_raw_floor':str(surplus//SCALE),'solvent':surplus>=0},'deposits':rows}
-          result['gates']={'deposit_balance_matches_total':sum_bal==total_staked,'deposit_ep_matches_total':sum_ep==total_power,'all_unclaimed_helpers_match_exact':True,'exact_accrued_plus_future_solvent':surplus>=0}
-          print('HORIZEN_R30_EXACT_JSON_BEGIN'); print(json.dumps(result,indent=2,sort_keys=True)); print('HORIZEN_R30_EXACT_JSON_END'); assert all(result['gates'].values()),result['gates']; print('HORIZEN_R30_EXACT_GATE=PASS'); print('PUBLIC_NETWORK_WRITES=0')
+
+          SEL = {
+              'deposits':'0xb02c43d0',
+              'unclaimed':'0xcb3056ad',
+              'rpt':'0xae0d27b6',
+              'staked':'0x817b1cd2',
+              'power':'0x08484dee',
+              'end':'0x37e9f64a',
+              'rate':'0xc3c16e4e',
+              'balance':'0x70a08231',
+          }
+          STAKE_TOPIC = '0x1a325385f16807e99fb688b597db78b00faee313dcf02e882dd16daab6fc3e1f'
+
+          events = logs(S, STAKE_TOPIC, START, latest)
+          ids = sorted({ui(item['topics'][2]) for item in events})
+
+          rpt = ui(call(S, SEL['rpt']))
+          total_staked = ui(call(S, SEL['staked']))
+          total_power = ui(call(S, SEL['power']))
+          reward_end = ui(call(S, SEL['end']))
+          rate = ui(call(S, SEL['rate']))
+          staker_balance = ui(call(T, SEL['balance'] + S[2:].rjust(64, '0')))
+
+          rows = []
+          helper_mismatches = []
+          checkpoint_regressions = []
+          sum_bal = 0
+          sum_ep = 0
+          sum_scaled = 0
+          sum_floor = 0
+
+          for deposit_id in ids:
+              decoded = words(call(S, SEL['deposits'] + pad(deposit_id)))
+              if len(decoded) < 7:
+                  raise AssertionError(f'deposit {deposit_id}: expected 7 words, got {len(decoded)}')
+
+              bal = ui('0x' + decoded[0])
+              owner = '0x' + decoded[1][-40:]
+              ep = ui('0x' + decoded[2])
+              delegatee = '0x' + decoded[3][-40:]
+              claimer = '0x' + decoded[4][-40:]
+              checkpoint = ui('0x' + decoded[5])
+              stored = ui('0x' + decoded[6])
+
+              if rpt < checkpoint:
+                  checkpoint_regressions.append({
+                      'deposit_id': deposit_id,
+                      'global_rpt': str(rpt),
+                      'deposit_checkpoint': str(checkpoint),
+                  })
+                  delta = 0
+              else:
+                  delta = rpt - checkpoint
+
+              exact = stored + ep * delta
+              helper = ui(call(S, SEL['unclaimed'] + pad(deposit_id)))
+              expected_helper = exact // SCALE
+              if helper != expected_helper:
+                  helper_mismatches.append({
+                      'deposit_id': deposit_id,
+                      'helper': str(helper),
+                      'expected': str(expected_helper),
+                      'difference': str(helper - expected_helper),
+                  })
+
+              sum_bal += bal
+              sum_ep += ep
+              sum_scaled += exact
+              sum_floor += helper
+              rows.append({
+                  'id': deposit_id,
+                  'balance': str(bal),
+                  'owner': owner,
+                  'earning_power': str(ep),
+                  'delegatee': delegatee,
+                  'claimer': claimer,
+                  'reward_per_token_checkpoint': str(checkpoint),
+                  'stored_scaled_unclaimed': str(stored),
+                  'live_scaled_unclaimed': str(exact),
+                  'helper_unclaimed_raw': str(helper),
+                  'helper_expected_raw': str(expected_helper),
+              })
+
+          remaining = max(reward_end - now, 0)
+          future_scaled = rate * remaining
+          backing_scaled = staker_balance * SCALE
+          total_liability = sum_scaled + future_scaled
+          surplus = backing_scaled - total_liability
+
+          gates = {
+              'deposit_balance_matches_total': sum_bal == total_staked,
+              'deposit_ep_matches_total': sum_ep == total_power,
+              'no_checkpoint_regressions': not checkpoint_regressions,
+              'all_unclaimed_helpers_match_exact': not helper_mismatches,
+              'exact_accrued_plus_future_solvent': surplus >= 0,
+          }
+
+          result = {
+              'classification':'PUBLIC_READ_ONLY_EXACT_LIABILITY',
+              'public_network_writes':0,
+              'collected_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'block_number':latest,
+              'block_hash':block.get('hash'),
+              'block_timestamp':now,
+              'stake_event_count':len(events),
+              'unique_deposit_ids':len(ids),
+              'reward_per_token_accumulated':str(rpt),
+              'aggregates':{
+                  'sum_deposit_balances':str(sum_bal),
+                  'contract_total_staked':str(total_staked),
+                  'principal_aggregate_delta':str(sum_bal-total_staked),
+                  'sum_deposit_earning_power':str(sum_ep),
+                  'contract_total_earning_power':str(total_power),
+                  'earning_power_aggregate_delta':str(sum_ep-total_power),
+              },
+              'liability':{
+                  'staker_token_balance_raw':str(staker_balance),
+                  'staker_backing_scaled':str(backing_scaled),
+                  'exact_accrued_scaled':str(sum_scaled),
+                  'helper_floor_accrued_raw':str(sum_floor),
+                  'reward_end':reward_end,
+                  'remaining_seconds':remaining,
+                  'scaled_reward_rate':str(rate),
+                  'future_stream_scaled':str(future_scaled),
+                  'total_accrued_plus_future_scaled':str(total_liability),
+                  'exact_surplus_scaled':str(surplus),
+                  'exact_surplus_raw_floor':str(surplus//SCALE),
+                  'solvent':surplus>=0,
+              },
+              'checkpoint_regressions':checkpoint_regressions,
+              'helper_mismatches':helper_mismatches,
+              'gates':gates,
+              'deposits':rows,
+          }
+
+          with open('evidence/horizen-r30-exact-liability.json', 'w', encoding='utf-8') as handle:
+              json.dump(result, handle, indent=2, sort_keys=True)
+              handle.write('\n')
+
+          print('HORIZEN_R30_EXACT_JSON_BEGIN')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          print('HORIZEN_R30_EXACT_JSON_END')
+          if not all(gates.values()):
+              raise AssertionError(gates)
+          print('HORIZEN_R30_EXACT_GATE=PASS')
+          print('PUBLIC_NETWORK_WRITES=0')
           PY
+
+      - name: Upload exact liability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-r30-exact-liability-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
