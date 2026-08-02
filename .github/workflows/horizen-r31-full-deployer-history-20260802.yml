@@ -1,0 +1,290 @@
+name: Temporary Horizen R31 full deployer history signature gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/horizen-r31-full-deployer-history-20260802.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  full-history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Enumerate full public deployer transaction history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          DEPLOYER = '0x9b264b21ca7659c256ad09171f827976acd5a1c3'
+          CHAINS = {
+              'mainnet': {
+                  'rpc': 'https://horizen.calderachain.xyz/http',
+                  'explorer': 'https://explorer.horizen.io',
+                  'chain_id': 26514,
+              },
+              'testnet': {
+                  'rpc': 'https://horizen-testnet.rpc.caldera.xyz/http',
+                  'explorer': 'https://explorer-testnet.horizen.io',
+                  'chain_id': 2651420,
+              },
+          }
+          request_id = 0
+
+          def get_json(url, tries=4):
+              last = None
+              for attempt in range(tries):
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          'accept':'application/json',
+                          'user-agent':'Horizen-R31-full-history/1',
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=45) as response:
+                          return json.loads(response.read())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2**attempt)
+              raise RuntimeError(f'GET failed: {url}: {last}')
+
+          def rpc(url, method, params, tries=4):
+              global request_id
+              last = None
+              for attempt in range(tries):
+                  request_id += 1
+                  body = json.dumps({
+                      'jsonrpc':'2.0',
+                      'id':request_id,
+                      'method':method,
+                      'params':params,
+                  }).encode()
+                  req = urllib.request.Request(
+                      url,
+                      data=body,
+                      headers={
+                          'content-type':'application/json',
+                          'user-agent':'Horizen-R31-full-history/1',
+                      },
+                      method='POST',
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=45) as response:
+                          obj = json.loads(response.read())
+                      if 'error' in obj:
+                          raise RuntimeError(obj['error'])
+                      return obj['result']
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2**attempt)
+              raise RuntimeError(f'RPC failed: {method}: {last}')
+
+          def collect_v2(base, address):
+              items = []
+              url = f'{base}/api/v2/addresses/{address}/transactions'
+              seen_urls = set()
+              while url:
+                  if url in seen_urls:
+                      raise RuntimeError('pagination loop')
+                  seen_urls.add(url)
+                  obj = get_json(url)
+                  page_items = obj.get('items')
+                  if not isinstance(page_items, list):
+                      raise RuntimeError(f'unexpected v2 response: {obj}')
+                  items.extend(page_items)
+                  nxt = obj.get('next_page_params')
+                  if not nxt:
+                      break
+                  url = f'{base}/api/v2/addresses/{address}/transactions?' + urllib.parse.urlencode(nxt)
+              hashes = {
+                  (item.get('hash') or '').lower()
+                  for item in items
+                  if (item.get('hash') or '').startswith('0x')
+              }
+              return sorted(hashes), {'api':'v2','items':len(items),'pages':len(seen_urls)}
+
+          def collect_legacy(base, address):
+              hashes = set()
+              page = 1
+              while True:
+                  query = urllib.parse.urlencode({
+                      'module':'account',
+                      'action':'txlist',
+                      'address':address,
+                      'startblock':0,
+                      'endblock':99999999,
+                      'page':page,
+                      'offset':1000,
+                      'sort':'asc',
+                  })
+                  obj = get_json(f'{base}/api?{query}')
+                  result = obj.get('result')
+                  if not isinstance(result, list):
+                      raise RuntimeError(f'unexpected legacy response: {obj}')
+                  for item in result:
+                      tx_hash = (item.get('hash') or '').lower()
+                      if tx_hash.startswith('0x'):
+                          hashes.add(tx_hash)
+                  if len(result) < 1000:
+                      break
+                  page += 1
+              return sorted(hashes), {'api':'legacy','pages':page}
+
+          def collect_hashes(base, address):
+              errors = []
+              for collector in (collect_v2, collect_legacy):
+                  try:
+                      hashes, meta = collector(base, address)
+                      if hashes:
+                          return hashes, meta, errors
+                  except Exception as exc:
+                      errors.append(f'{collector.__name__}: {exc}')
+              raise RuntimeError('; '.join(errors))
+
+          chain_results = {}
+          all_txs = []
+
+          for label, cfg in CHAINS.items():
+              chain_id = int(rpc(cfg['rpc'], 'eth_chainId', []), 16)
+              nonce_latest = int(rpc(cfg['rpc'], 'eth_getTransactionCount', [DEPLOYER, 'latest']), 16)
+              hashes, explorer_meta, explorer_errors = collect_hashes(cfg['explorer'], DEPLOYER)
+              txs = []
+              for tx_hash in hashes:
+                  tx = rpc(cfg['rpc'], 'eth_getTransactionByHash', [tx_hash])
+                  if not tx:
+                      continue
+                  if (tx.get('from') or '').lower() != DEPLOYER:
+                      continue
+                  row = {
+                      'chain':label,
+                      'hash':tx_hash,
+                      'block_number':int(tx['blockNumber'],16) if tx.get('blockNumber') else None,
+                      'nonce':int(tx['nonce'],16),
+                      'type':int(tx.get('type','0x0'),16),
+                      'chain_id':int(tx['chainId'],16) if tx.get('chainId') else None,
+                      'to':(tx.get('to') or '').lower() or None,
+                      'input_selector':(tx.get('input') or '0x')[:10].lower(),
+                      'value':str(int(tx.get('value','0x0'),16)),
+                      'v':(tx.get('v') or '').lower() or None,
+                      'r':(tx.get('r') or '').lower() or None,
+                      's':(tx.get('s') or '').lower() or None,
+                      'authorization_list':tx.get('authorizationList'),
+                  }
+                  txs.append(row)
+                  all_txs.append(row)
+
+              txs.sort(key=lambda row:(row['nonce'], row['hash']))
+              unique_nonces = sorted({row['nonce'] for row in txs})
+              missing_nonces = [n for n in range(nonce_latest) if n not in set(unique_nonces)]
+              duplicate_nonce_groups = []
+              by_nonce = {}
+              for row in txs:
+                  by_nonce.setdefault(row['nonce'], []).append(row)
+              for nonce, rows in sorted(by_nonce.items()):
+                  if len({row['hash'] for row in rows}) > 1:
+                      duplicate_nonce_groups.append({'nonce':nonce,'transactions':rows})
+
+              chain_results[label] = {
+                  'expected_chain_id':cfg['chain_id'],
+                  'observed_chain_id':chain_id,
+                  'latest_account_nonce':nonce_latest,
+                  'explorer_hashes':len(hashes),
+                  'sender_transactions_resolved':len(txs),
+                  'unique_sender_nonces':len(unique_nonces),
+                  'minimum_nonce':min(unique_nonces) if unique_nonces else None,
+                  'maximum_nonce':max(unique_nonces) if unique_nonces else None,
+                  'missing_nonces':missing_nonces,
+                  'duplicate_nonce_groups':duplicate_nonce_groups,
+                  'explorer_meta':explorer_meta,
+                  'explorer_fallback_errors':explorer_errors,
+                  'transactions':txs,
+              }
+
+          repeated_r = []
+          by_r = {}
+          for row in all_txs:
+              r = row.get('r')
+              if not r or int(r,16) == 0:
+                  continue
+              by_r.setdefault(r, []).append(row)
+          for r, rows in sorted(by_r.items()):
+              if len({row['hash'] for row in rows}) > 1:
+                  repeated_r.append({'r':r,'transactions':rows})
+
+          unprotected = []
+          authorization_txs = []
+          for row in all_txs:
+              v = int(row['v'],16) if row.get('v') else None
+              if row['type'] == 0 and v in (27,28):
+                  unprotected.append(row)
+              if row.get('authorization_list'):
+                  authorization_txs.append(row)
+
+          synthetic = [
+              {'hash':'0x01','r':'0x'+'22'*32},
+              {'hash':'0x02','r':'0x'+'22'*32},
+          ]
+          positive = len({row['hash'] for row in synthetic}) == 2 and len({row['r'] for row in synthetic}) == 1
+
+          coverage_complete = all(
+              not value['missing_nonces']
+              and value['sender_transactions_resolved'] == value['latest_account_nonce']
+              and value['minimum_nonce'] == 0
+              and value['maximum_nonce'] == value['latest_account_nonce'] - 1
+              for value in chain_results.values()
+          )
+          gates = {
+              'chain_ids_match':all(v['expected_chain_id']==v['observed_chain_id'] for v in chain_results.values()),
+              'full_nonce_coverage':coverage_complete,
+              'no_repeated_signature_r':not repeated_r,
+              'no_unprotected_legacy_transactions':not unprotected,
+              'no_authorization_list_transactions':not authorization_txs,
+              'positive_control_detected':positive,
+          }
+
+          result = {
+              'classification':'PUBLIC_READ_ONLY_FULL_DEPLOYER_HISTORY',
+              'public_network_writes':0,
+              'collected_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+              'deployer':DEPLOYER,
+              'total_transactions_inspected':len(all_txs),
+              'chains':chain_results,
+              'repeated_r_groups':repeated_r,
+              'unprotected_legacy_transactions':unprotected,
+              'authorization_list_transactions':authorization_txs,
+              'positive_control_detected':positive,
+              'gates':gates,
+          }
+          with open('evidence/horizen-r31-full-deployer-history.json','w',encoding='utf-8') as handle:
+              json.dump(result,handle,indent=2,sort_keys=True)
+              handle.write('\n')
+          print('HORIZEN_R31_FULL_JSON_BEGIN')
+          print(json.dumps(result,indent=2,sort_keys=True))
+          print('HORIZEN_R31_FULL_JSON_END')
+          if not all(gates.values()):
+              raise AssertionError(gates)
+          print('HORIZEN_R31_FULL_GATE=PASS')
+          print('PUBLIC_NETWORK_WRITES=0')
+          PY
+
+      - name: Upload full history evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-r31-full-deployer-history-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
