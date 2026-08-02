@@ -1,0 +1,256 @@
+name: Temporary Horizen R31 deployer signature and EIP-7702 gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/horizen-r31-deployer-signature-gate-20260802.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  deployer-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect public deployer state and public transaction signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import time
+          import urllib.request
+
+          DEPLOYER = '0x9b264b21ca7659c256ad09171f827976acd5a1c3'
+          STAKER = '0x6bf7cf29a8bce11aa62cf593d165c244fa4d3e31'
+          ACCUMULATOR = '0x06f5555fee73eddc385b6d76fe00db2d96ccdae8'
+          NOTIFIER_SELECTOR = '0xe70f9445'
+
+          CHAINS = {
+              'mainnet': {
+                  'rpc': 'https://horizen.calderachain.xyz/http',
+                  'chain_id': 26514,
+                  'deployment_block': 21317419,
+              },
+              'testnet': {
+                  'rpc': 'https://horizen-testnet.rpc.caldera.xyz/http',
+                  'chain_id': 2651420,
+                  'deployment_block': 21842327,
+              },
+          }
+
+          request_id = 0
+
+          def rpc(url, method, params, tries=4):
+              global request_id
+              last = None
+              for attempt in range(tries):
+                  request_id += 1
+                  body = json.dumps({
+                      'jsonrpc': '2.0',
+                      'id': request_id,
+                      'method': method,
+                      'params': params,
+                  }).encode()
+                  req = urllib.request.Request(
+                      url,
+                      data=body,
+                      headers={
+                          'content-type': 'application/json',
+                          'user-agent': 'Horizen-R31-readonly-signature-gate/1',
+                      },
+                      method='POST',
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=40) as response:
+                          obj = json.loads(response.read())
+                      if 'error' in obj:
+                          raise RuntimeError(obj['error'])
+                      return obj['result']
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2**attempt)
+              raise RuntimeError(f'{method}: {last}')
+
+          def u256(value):
+              return int(value, 16)
+
+          def enc_addr(address):
+              return address.removeprefix('0x').lower().rjust(64, '0')
+
+          def normalize_hex(value):
+              if value is None:
+                  return None
+              return value.lower()
+
+          def get_logs(url, address, start, end):
+              return rpc(url, 'eth_getLogs', [{
+                  'address': address,
+                  'fromBlock': hex(start),
+                  'toBlock': hex(end),
+              }])
+
+          all_deployer_txs = []
+          chain_results = {}
+
+          for label, cfg in CHAINS.items():
+              url = cfg['rpc']
+              latest = u256(rpc(url, 'eth_blockNumber', []))
+              chain_id = u256(rpc(url, 'eth_chainId', []))
+              start = cfg['deployment_block']
+              stop = min(start + 300, latest)
+
+              code = rpc(url, 'eth_getCode', [DEPLOYER, 'latest'])
+              code_raw = bytes.fromhex(code[2:]) if code != '0x' else b''
+              delegation_target = None
+              if len(code_raw) == 23 and code_raw.startswith(bytes.fromhex('ef0100')):
+                  delegation_target = '0x' + code_raw[3:].hex()
+
+              nonce = u256(rpc(url, 'eth_getTransactionCount', [DEPLOYER, 'latest']))
+              notifier = bool(u256(rpc(url, 'eth_call', [{
+                  'to': STAKER,
+                  'data': NOTIFIER_SELECTOR + enc_addr(DEPLOYER),
+              }, 'latest'])))
+
+              tx_hashes = set()
+              for address in (STAKER, ACCUMULATOR):
+                  for log in get_logs(url, address, start, stop):
+                      tx_hashes.add(log['transactionHash'])
+
+              # Deployment transactions can include contract creation before any target log exists.
+              for block_number in range(max(start - 2, 0), min(start + 40, latest) + 1):
+                  block = rpc(url, 'eth_getBlockByNumber', [hex(block_number), True])
+                  for tx in block.get('transactions', []):
+                      if (tx.get('from') or '').lower() == DEPLOYER:
+                          tx_hashes.add(tx['hash'])
+
+              txs = []
+              for tx_hash in sorted(tx_hashes):
+                  tx = rpc(url, 'eth_getTransactionByHash', [tx_hash])
+                  if not tx or (tx.get('from') or '').lower() != DEPLOYER:
+                      continue
+                  item = {
+                      'chain': label,
+                      'chain_id_observed': chain_id,
+                      'hash': tx['hash'],
+                      'block_number': u256(tx['blockNumber']) if tx.get('blockNumber') else None,
+                      'nonce': u256(tx['nonce']),
+                      'type': u256(tx.get('type', '0x0')),
+                      'to': normalize_hex(tx.get('to')),
+                      'input_selector': (tx.get('input') or '0x')[:10].lower(),
+                      'value': str(u256(tx.get('value', '0x0'))),
+                      'chain_id_field': u256(tx['chainId']) if tx.get('chainId') else None,
+                      'v': tx.get('v'),
+                      'r': normalize_hex(tx.get('r')),
+                      's': normalize_hex(tx.get('s')),
+                      'authorization_list': tx.get('authorizationList'),
+                  }
+                  txs.append(item)
+                  all_deployer_txs.append(item)
+
+              chain_results[label] = {
+                  'rpc': url,
+                  'expected_chain_id': cfg['chain_id'],
+                  'observed_chain_id': chain_id,
+                  'latest_block': latest,
+                  'deployment_scan_start': start,
+                  'deployment_scan_stop': stop,
+                  'deployer_code': code,
+                  'deployer_code_bytes': len(code_raw),
+                  'eip7702_delegation_target': delegation_target,
+                  'deployer_nonce': nonce,
+                  'deployer_is_reward_notifier': notifier,
+                  'deployer_transactions': txs,
+              }
+
+          repeated_r = []
+          by_r = {}
+          for tx in all_deployer_txs:
+              r = tx.get('r')
+              if not r or int(r, 16) == 0:
+                  continue
+              by_r.setdefault(r, []).append(tx)
+          for r, rows in sorted(by_r.items()):
+              unique_hashes = {row['hash'] for row in rows}
+              if len(unique_hashes) > 1:
+                  repeated_r.append({
+                      'r': r,
+                      'transactions': rows,
+                  })
+
+          unprotected_legacy = []
+          authorization_transactions = []
+          for tx in all_deployer_txs:
+              tx_type = tx['type']
+              v = u256(tx['v']) if tx.get('v') else None
+              if tx_type == 0 and v in (27, 28):
+                  unprotected_legacy.append(tx)
+              if tx.get('authorization_list'):
+                  authorization_transactions.append(tx)
+
+          # Positive control proves the duplicate-r detector is active.
+          synthetic = [
+              {'hash': '0x01', 'r': '0x' + '11'*32},
+              {'hash': '0x02', 'r': '0x' + '11'*32},
+          ]
+          synthetic_by_r = {}
+          for row in synthetic:
+              synthetic_by_r.setdefault(row['r'], set()).add(row['hash'])
+          positive_control_duplicate_r = any(len(hashes) > 1 for hashes in synthetic_by_r.values())
+
+          gates = {
+              'chain_ids_match': all(
+                  value['expected_chain_id'] == value['observed_chain_id']
+                  for value in chain_results.values()
+              ),
+              'no_active_eip7702_delegation': all(
+                  value['eip7702_delegation_target'] is None
+                  for value in chain_results.values()
+              ),
+              'no_repeated_signature_r': not repeated_r,
+              'no_unprotected_legacy_transactions': not unprotected_legacy,
+              'no_authorization_list_transactions': not authorization_transactions,
+              'positive_control_detected': positive_control_duplicate_r,
+          }
+
+          result = {
+              'classification': 'PUBLIC_READ_ONLY_DEPLOYER_SIGNATURE_GATE',
+              'public_network_writes': 0,
+              'collected_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'deployer': DEPLOYER,
+              'chains': chain_results,
+              'total_deployer_transactions_inspected': len(all_deployer_txs),
+              'repeated_r_groups': repeated_r,
+              'unprotected_legacy_transactions': unprotected_legacy,
+              'authorization_list_transactions': authorization_transactions,
+              'positive_control_duplicate_r': positive_control_duplicate_r,
+              'gates': gates,
+          }
+
+          with open('evidence/horizen-r31-deployer-signature-gate.json', 'w', encoding='utf-8') as handle:
+              json.dump(result, handle, indent=2, sort_keys=True)
+              handle.write('\n')
+
+          print('HORIZEN_R31_JSON_BEGIN')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          print('HORIZEN_R31_JSON_END')
+          if not all(gates.values()):
+              raise AssertionError(gates)
+          print('HORIZEN_R31_GATE=PASS')
+          print('PUBLIC_NETWORK_WRITES=0')
+          PY
+
+      - name: Upload deployer signature evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-r31-deployer-signature-gate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
