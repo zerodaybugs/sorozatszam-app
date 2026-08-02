@@ -1,0 +1,139 @@
+name: Binance P2P API Probe
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch and filter current Binance P2P ads
+        id: probe
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re, urllib.request, urllib.error
+          from decimal import Decimal, InvalidOperation
+
+          methods_url = 'https://www.binance.com/bapi/c2c/v1/public/c2c/agent/trade-methods?fiat=EUR'
+          ads_url = 'https://www.binance.com/bapi/c2c/v1/public/c2c/agent/ad-list?fiat=EUR&asset=USDT&tradeType=SELL&limit=20'
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers={
+                  'User-Agent': 'Mozilla/5.0 (compatible; ZeroDayBugs-P2P-Monitor/1.0)',
+                  'Accept': 'application/json, text/plain, */*',
+                  'Accept-Language': 'en-US,en;q=0.9',
+              })
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  body = r.read(5_000_000)
+                  if r.status != 200:
+                      raise RuntimeError(f'HTTP {r.status}')
+              value = json.loads(body.decode('utf-8'))
+              if not isinstance(value, dict):
+                  raise RuntimeError('top-level JSON is not an object')
+              return value
+
+          def ok(payload):
+              return payload.get('success') is True or str(payload.get('code', '')).upper() in {'000000','0','SUCCESS'}
+
+          def rows(payload):
+              data = payload.get('data')
+              if isinstance(data, list): return data
+              if isinstance(data, dict):
+                  for k in ('data','list','rows','items','ads'):
+                      if isinstance(data.get(k), list): return data[k]
+              return []
+
+          def dec(v):
+              try: return Decimal(str(v))
+              except (InvalidOperation, TypeError, ValueError): return Decimal('0')
+
+          def norm(v):
+              return re.sub(r'[^a-z0-9]+', ' ', str(v or '').casefold()).strip()
+
+          def methods(adv, row):
+              out=[]
+              for source in (adv,row):
+                  for key in ('tradeMethods','payTypes','paymentMethods','tradeMethodNames'):
+                      value=source.get(key)
+                      values=value if isinstance(value,list) else ([value] if value else [])
+                      for item in values:
+                          if isinstance(item,dict):
+                              x=item.get('tradeMethodName') or item.get('identifier') or item.get('name') or item.get('code')
+                          else: x=item
+                          if x is not None and str(x).strip() and str(x).strip() not in out: out.append(str(x).strip())
+              return out
+
+          def excluded(ms):
+              text=' '.join(norm(x) for x in ms)
+              return 'dukascopy' in text or ('bizum' in text and 'bbva' in text)
+
+          def completion(advertiser):
+              for key in ('monthFinishRate','finishRate','completionRate','positiveRate'):
+                  if advertiser.get(key) is not None:
+                      x=dec(advertiser[key]); return x*100 if x<=1 else x
+              return Decimal('0')
+
+          result={'validated':False,'matches':[]}
+          try:
+              mp=fetch(methods_url); ap=fetch(ads_url)
+              open('trade-methods.raw.json','w',encoding='utf-8').write(json.dumps(mp,ensure_ascii=False,indent=2))
+              open('ad-list.raw.json','w',encoding='utf-8').write(json.dumps(ap,ensure_ascii=False,indent=2))
+              rr=rows(ap)
+              if not ok(mp) or not ok(ap) or not rr:
+                  raise RuntimeError(f'validation failed methods={ok(mp)} ads={ok(ap)} rows={len(rr)}')
+              found=[]
+              for row in rr:
+                  if not isinstance(row,dict): continue
+                  adv=row.get('adv') if isinstance(row.get('adv'),dict) else row
+                  advertiser=row.get('advertiser') if isinstance(row.get('advertiser'),dict) else {}
+                  price=dec(adv.get('price')); ms=methods(adv,row)
+                  if price < Decimal('0.900') or excluded(ms): continue
+                  surplus=dec(adv.get('surplusAmount',adv.get('tradableQuantity',adv.get('availableAmount',0))))
+                  available=price*surplus
+                  min_eur=dec(adv.get('minSingleTransAmount'))
+                  max_eur=dec(adv.get('dynamicMaxSingleTransAmount',adv.get('maxSingleTransAmount',0)))
+                  rate=completion(advertiser)
+                  adno=str(adv.get('advNo') or adv.get('adNo') or row.get('advNo') or '')
+                  nickname=str(advertiser.get('nickName') or advertiser.get('nickname') or adv.get('nickName') or '')
+                  text=' '.join(norm(x) for x in ms)
+                  pref=(8 if 'sepa instant' in text else 0)+(4 if 'sepa' in text else 0)+(3 if 'santander' in text else 0)+(2 if 'revolut' in text else 0)
+                  found.append({
+                    'adNo':adno,'price':str(price),'advertiser':nickname,'paymentMethods':ms,
+                    'remainingUSDT':str(surplus),'approxAvailableEUR':str(available.quantize(Decimal('0.01'))),
+                    'minOrderEUR':str(min_eur),'maxOrderEUR':str(max_eur),
+                    'completionRatePercent':str(rate.quantize(Decimal('0.01'))),
+                    'supportsAtLeast1000EUR':available>=1000 and max_eur>=1000,
+                    'preferredPaymentScore':pref,
+                    'directLink':f'https://c2c.binance.com/en/adv?code={adno}' if adno else ''
+                  })
+              found.sort(key=lambda x:(dec(x['price']),dec(x['approxAvailableEUR'])>=1000,dec(x['maxOrderEUR'])>=1000,x['preferredPaymentScore'],dec(x['completionRatePercent'])),reverse=True)
+              result={'validated':True,'activeAdCount':len(rr),'mandatoryMatchCount':len(found),'matches':found[:5]}
+          except Exception as e:
+              result['error']=f'{type(e).__name__}: {e}'
+          open('result.json','w',encoding='utf-8').write(json.dumps(result,ensure_ascii=False,indent=2))
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          raise SystemExit(0 if result.get('validated') else 2)
+          PY
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-p2p-probe-result
+          path: |
+            result.json
+            trade-methods.raw.json
+            ad-list.raw.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Preserve failure state
+        if: steps.probe.outcome == 'failure'
+        run: exit 1
