@@ -1,0 +1,90 @@
+name: Binance P2P Direct Probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/binance-p2p-direct-probe.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch, validate and filter Binance P2P ads
+        shell: bash
+        run: |
+          mkdir -p automation
+          python3 - <<'PY'
+          import json, re, urllib.request
+          from decimal import Decimal, InvalidOperation
+          from datetime import datetime, timezone
+
+          MU='https://www.binance.com/bapi/c2c/v1/public/c2c/agent/trade-methods?fiat=EUR'
+          AU='https://www.binance.com/bapi/c2c/v1/public/c2c/agent/ad-list?fiat=EUR&asset=USDT&tradeType=SELL&limit=20'
+          def get(u):
+              req=urllib.request.Request(u,headers={'User-Agent':'Mozilla/5.0 (compatible; ZeroDayBugs-P2P-Monitor/1.0)','Accept':'application/json, text/plain, */*'})
+              with urllib.request.urlopen(req,timeout=30) as r:
+                  if r.status!=200: raise RuntimeError(f'HTTP {r.status}')
+                  x=json.loads(r.read(5_000_000).decode())
+              if not isinstance(x,dict): raise RuntimeError('invalid top-level JSON')
+              return x
+          def ok(x): return x.get('success') is True or str(x.get('code','')).upper() in {'000000','0','SUCCESS'}
+          def rows(x):
+              d=x.get('data')
+              if isinstance(d,list): return d
+              if isinstance(d,dict):
+                  for k in ('data','list','rows','items','ads'):
+                      if isinstance(d.get(k),list): return d[k]
+              return []
+          def dec(v):
+              try:return Decimal(str(v))
+              except (InvalidOperation,TypeError,ValueError):return Decimal('0')
+          def norm(v):return re.sub(r'[^a-z0-9]+',' ',str(v or '').casefold()).strip()
+          def methods(a,row):
+              out=[]
+              for src in (a,row):
+                  for k in ('tradeMethods','payTypes','paymentMethods','tradeMethodNames'):
+                      v=src.get(k); vals=v if isinstance(v,list) else ([v] if v else [])
+                      for it in vals:
+                          z=(it.get('tradeMethodName') or it.get('identifier') or it.get('name') or it.get('code')) if isinstance(it,dict) else it
+                          if z is not None and str(z).strip() and str(z).strip() not in out:out.append(str(z).strip())
+              return out
+          def rate(x):
+              for k in ('monthFinishRate','finishRate','completionRate','positiveRate'):
+                  if x.get(k) is not None:
+                      y=dec(x[k]);return y*100 if y<=1 else y
+              return Decimal('0')
+          result={'checkedAtUtc':datetime.now(timezone.utc).isoformat(),'validated':False,'matches':[]}
+          try:
+              mp=get(MU);ap=get(AU);rr=rows(ap)
+              if not ok(mp) or not ok(ap) or not rr:raise RuntimeError(f'validation failed methods={ok(mp)} ads={ok(ap)} rows={len(rr)}')
+              found=[]
+              for row in rr:
+                  if not isinstance(row,dict):continue
+                  a=row.get('adv') if isinstance(row.get('adv'),dict) else row
+                  user=row.get('advertiser') if isinstance(row.get('advertiser'),dict) else {}
+                  p=dec(a.get('price'));ms=methods(a,row);txt=' '.join(norm(x) for x in ms)
+                  if p<Decimal('0.900') or 'dukascopy' in txt or ('bizum' in txt and 'bbva' in txt):continue
+                  surplus=dec(a.get('surplusAmount',a.get('tradableQuantity',a.get('availableAmount',0))));avail=p*surplus
+                  mn=dec(a.get('minSingleTransAmount'));mx=dec(a.get('dynamicMaxSingleTransAmount',a.get('maxSingleTransAmount',0)));rt=rate(user)
+                  no=str(a.get('advNo') or a.get('adNo') or row.get('advNo') or '');nick=str(user.get('nickName') or user.get('nickname') or a.get('nickName') or '')
+                  pref=(8 if 'sepa instant' in txt else 0)+(4 if 'sepa' in txt else 0)+(3 if 'santander' in txt else 0)+(2 if 'revolut' in txt else 0)
+                  found.append({'adNo':no,'price':str(p),'advertiser':nick,'paymentMethods':ms,'remainingUSDT':str(surplus),'approxAvailableEUR':str(avail.quantize(Decimal('0.01'))),'minOrderEUR':str(mn),'maxOrderEUR':str(mx),'completionRatePercent':str(rt.quantize(Decimal('0.01'))),'supportsAtLeast1000EUR':avail>=1000 and mx>=1000,'preferredPaymentScore':pref,'directLink':f'https://c2c.binance.com/en/adv?code={no}' if no else ''})
+              found.sort(key=lambda x:(dec(x['price']),dec(x['approxAvailableEUR'])>=1000,dec(x['maxOrderEUR'])>=1000,x['preferredPaymentScore'],dec(x['completionRatePercent'])),reverse=True)
+              result.update({'validated':True,'activeAdCount':len(rr),'mandatoryMatchCount':len(found),'matches':found[:5]})
+          except Exception as e:result['error']=f'{type(e).__name__}: {e}'
+          open('automation/binance_p2p_direct_result.json','w',encoding='utf-8').write(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+      - name: Commit probe result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add automation/binance_p2p_direct_result.json
+          git commit -m 'Record Binance P2P probe result [skip ci]'
+          git push
