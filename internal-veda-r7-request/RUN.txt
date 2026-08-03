@@ -1,0 +1,1 @@
+Execute one run-bound encrypted, read-only, local-fork security validation. No public-chain transaction is signed or broadcast. Do not merge.
