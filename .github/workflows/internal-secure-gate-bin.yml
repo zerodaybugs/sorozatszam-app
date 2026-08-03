@@ -55,7 +55,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Retrieve run-bound binary CMS payload
+      - name: Retrieve run-bound binary CMS chunks
         shell: bash
         run: |
           set -euo pipefail
@@ -67,11 +67,12 @@ jobs:
             git clone --quiet --depth 1 --branch internal/secure-gate-bin-payload-20260803 \
               https://github.com/zerodaybugs/sorozatszam-app.git /tmp/secure-gate-transport/repo 2>/dev/null || true
             payload_dir=/tmp/secure-gate-transport/repo/internal-secure-payload
-            if test -s "$payload_dir/payload.cms" \
+            part_count=$(find "$payload_dir" -maxdepth 1 -type f -name 'payload.cms.part-*' 2>/dev/null | wc -l)
+            if test "$part_count" -eq 8 \
                && test -s "$payload_dir/payload.cms.sha256" \
                && test -s "$payload_dir/run-id.txt" \
                && test "$(tr -d '\r\n' < "$payload_dir/run-id.txt")" = "$GITHUB_RUN_ID"; then
-              cp "$payload_dir/payload.cms" /tmp/secure-gate-transport/
+              cat "$payload_dir"/payload.cms.part-* > /tmp/secure-gate-transport/payload.cms
               cp "$payload_dir/payload.cms.sha256" /tmp/secure-gate-transport/
               cp "$payload_dir/run-id.txt" /tmp/secure-gate-transport/
               if (cd /tmp/secure-gate-transport && sha256sum --check --strict payload.cms.sha256); then
