@@ -1,0 +1,1 @@
+Execute one isolated, encrypted, read-only multichain local-fork validation through the keyless Routescan archive-state proxy. The public request contains no vulnerability source, target details, credentials, signer, transaction construction, or broadcast path. Do not merge.
