@@ -67,7 +67,11 @@ jobs:
             git clone --quiet --depth 1 --branch internal/secure-gate-bin-payload-20260803 \
               https://github.com/zerodaybugs/sorozatszam-app.git /tmp/secure-gate-transport/repo 2>/dev/null || true
             payload_dir=/tmp/secure-gate-transport/repo/internal-secure-payload
-            part_count=$(find "$payload_dir" -maxdepth 1 -type f -name 'payload.cms.part-*' 2>/dev/null | wc -l)
+            if [[ -d "$payload_dir" ]]; then
+              part_count=$(find "$payload_dir" -maxdepth 1 -type f -name 'payload.cms.part-*' 2>/dev/null | wc -l || true)
+            else
+              part_count=0
+            fi
             if test "$part_count" -eq 8 \
                && test -s "$payload_dir/payload.cms.sha256" \
                && test -s "$payload_dir/run-id.txt" \
