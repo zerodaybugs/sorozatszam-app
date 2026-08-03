@@ -1,1 +1,1 @@
-Execute one isolated, encrypted, read-only multichain local-fork validation revision CAUSAL-CODE-FALLBACK-R1. The public request contains no vulnerability source, target details, credentials, signer, transaction construction, or broadcast path. Do not merge.
+Execute one isolated, encrypted, read-only multichain local-fork validation revision CAUSAL-PUBLIC-ARCHIVE-FIRST-R2. The public request contains no vulnerability source, target details, credentials, signer, transaction construction, or broadcast path. Do not merge.
