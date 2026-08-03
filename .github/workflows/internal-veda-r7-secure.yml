@@ -1,0 +1,210 @@
+name: internal Veda R7 secure validation
+
+on:
+  pull_request:
+    branches:
+      - internal/veda-r7-base-20260803
+    paths:
+      - "internal-veda-r7-request/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: internal-veda-r7-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 58
+    steps:
+      - name: Checkout isolated request
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Generate one-time runner certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p handshake-public
+          openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 1 \
+            -subj '/CN=ephemeral-veda-r7-runner' \
+            -keyout /tmp/veda-r7-runner-private.pem \
+            -out handshake-public/runner-certificate.pem \
+            >/dev/null 2>&1
+          openssl x509 -in handshake-public/runner-certificate.pem -noout -fingerprint -sha256 \
+            > handshake-public/runner-certificate.sha256-fingerprint.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > handshake-public/run-id.txt
+          chmod 600 /tmp/veda-r7-runner-private.pem
+          chmod 644 handshake-public/*
+
+      - name: Publish one-time certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r7-handshake-${{ github.run_id }}
+          path: handshake-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retrieve run-bound encrypted payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/veda-r7-transport
+          mkdir -p /tmp/veda-r7-transport
+          found=0
+          for attempt in $(seq 1 650); do
+            rm -rf /tmp/veda-r7-transport/repo
+            git clone --quiet --depth 1 --branch internal/veda-r7-payload-20260803 \
+              https://github.com/zerodaybugs/sorozatszam-app.git \
+              /tmp/veda-r7-transport/repo 2>/dev/null || true
+            payload_dir=/tmp/veda-r7-transport/repo/internal-veda-r7-payload
+            if [[ -d "$payload_dir" ]]; then
+              shopt -s nullglob
+              parts=("$payload_dir"/payload.cms.b64.part-*)
+              if [[ "${#parts[@]}" -eq 8 ]] \
+                 && [[ -s "$payload_dir/payload.cms.sha256" ]] \
+                 && [[ -s "$payload_dir/run-id.txt" ]] \
+                 && [[ "$(tr -d '\r\n' < "$payload_dir/run-id.txt")" = "$GITHUB_RUN_ID" ]]; then
+                cat "${parts[@]}" > /tmp/veda-r7-transport/payload.cms.b64
+                base64 --decode /tmp/veda-r7-transport/payload.cms.b64 \
+                  > /tmp/veda-r7-transport/payload.cms
+                cp "$payload_dir/payload.cms.sha256" /tmp/veda-r7-transport/
+                cp "$payload_dir/run-id.txt" /tmp/veda-r7-transport/
+                if (cd /tmp/veda-r7-transport && sha256sum --check --strict payload.cms.sha256); then
+                  found=1
+                  break
+                fi
+              fi
+            fi
+            sleep 4
+          done
+          test "$found" -eq 1
+          test "$(tr -d '\r\n' < /tmp/veda-r7-transport/run-id.txt)" = "$GITHUB_RUN_ID"
+          (cd /tmp/veda-r7-transport && sha256sum --check --strict payload.cms.sha256)
+
+      - name: Decrypt, verify, and execute local-only proof
+        id: proof
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          rm -rf /tmp/veda-r7-work result-public result-encrypted
+          mkdir -p /tmp/veda-r7-work/lib result-public result-encrypted
+          printf 'payload_received\n' > result-public/STAGE.txt
+
+          openssl cms -decrypt -binary -inform DER \
+            -in /tmp/veda-r7-transport/payload.cms \
+            -recip handshake-public/runner-certificate.pem \
+            -inkey /tmp/veda-r7-runner-private.pem \
+            -out /tmp/veda-r7-payload.tar.gz \
+            >/dev/null 2>&1
+          tar -xzf /tmp/veda-r7-payload.tar.gz -C /tmp/veda-r7-work
+          (cd /tmp/veda-r7-work && sha256sum --check --strict INPUT_SHA256SUMS)
+          printf 'payload_verified\n' > result-public/STAGE.txt
+
+          git clone --quiet --depth 1 --branch v1.9.6 \
+            https://github.com/foundry-rs/forge-std.git /tmp/veda-r7-work/lib/forge-std
+          curl -fsSL --retry 4 --retry-all-errors \
+            'https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.29+commit.ab55807c' \
+            -o /tmp/veda-r7-work/solc
+          echo '18d418a40dc04d17656b1b5c8a7b35cfbab8942b51f38d005d5b59e8aa6637e0  /tmp/veda-r7-work/solc' \
+            | sha256sum --check --strict >/dev/null
+          chmod 0755 /tmp/veda-r7-work/solc /tmp/veda-r7-work/RUN.sh
+          printf 'toolchain_ready\n' > result-public/STAGE.txt
+
+          set +e
+          (cd /tmp/veda-r7-work && ./RUN.sh)
+          run_status=$?
+          set -e
+          mkdir -p /tmp/veda-r7-work/evidence
+          printf '%s\n' "$run_status" > /tmp/veda-r7-work/evidence/RUNNER_EXIT_STATUS.txt
+          forge --version > /tmp/veda-r7-work/evidence/WORKFLOW_FORGE_VERSION.txt 2>&1
+          /tmp/veda-r7-work/solc --version > /tmp/veda-r7-work/evidence/WORKFLOW_SOLC_VERSION.txt 2>&1
+          (cd /tmp/veda-r7-work/evidence && \
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+
+          printf '%s\n' "$run_status" > result-public/RUNNER_EXIT_STATUS.txt
+          printf 'proof_finished\n' > result-public/STAGE.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          ev=Path('/tmp/veda-r7-work/evidence')
+          status=int(Path('result-public/RUNNER_EXIT_STATUS.txt').read_text().strip())
+          names={p.name for p in ev.glob('*') if p.is_file()}
+          public={
+            'run_id': '${{ github.run_id }}',
+            'runner_exit_status': status,
+            'live_gate_file_present': 'LIVE_GATE.json' in names,
+            'preflight_file_present': 'PREFLIGHT.json' in names,
+            'poc_summary_file_present': 'POC_SUMMARY.json' in names,
+            'forge_output_present': 'FORGE_OUTPUT.txt' in names,
+            'technical_evidence_file_count': len(names),
+            'public_chain_transactions_signed': 0,
+            'public_chain_transactions_broadcast': 0,
+          }
+          Path('result-public/PUBLIC_STATUS.json').write_text(json.dumps(public,indent=2,sort_keys=True)+'\n')
+          PY
+          exit "$run_status"
+
+      - name: Encrypt full evidence to researcher certificate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p result-public result-encrypted /tmp/veda-r7-work/evidence
+          if [[ ! -s result-public/RUNNER_EXIT_STATUS.txt ]]; then
+            printf '99\n' > result-public/RUNNER_EXIT_STATUS.txt
+          fi
+          if [[ ! -s result-public/STAGE.txt ]]; then
+            printf 'failed_before_proof_wrapper\n' > result-public/STAGE.txt
+          fi
+          if [[ -s /tmp/veda-r7-work/researcher-certificate.pem ]]; then
+            tar -czf /tmp/veda-r7-evidence.tar.gz -C /tmp/veda-r7-work evidence
+            openssl cms -encrypt -binary -aes-256-cbc -outform DER \
+              -in /tmp/veda-r7-evidence.tar.gz \
+              -out result-encrypted/evidence.cms \
+              /tmp/veda-r7-work/researcher-certificate.pem \
+              >/dev/null 2>&1
+            sha256sum result-encrypted/evidence.cms > result-encrypted/evidence.cms.sha256
+            printf 'encrypted_evidence_complete\n' > result-encrypted/STATUS.txt
+          else
+            printf 'researcher_certificate_unavailable\n' > result-encrypted/STATUS.txt
+          fi
+          cp result-public/RUNNER_EXIT_STATUS.txt result-encrypted/
+          sha256sum result-public/* > result-public/SHA256SUMS 2>/dev/null || true
+          shred -u /tmp/veda-r7-runner-private.pem /tmp/veda-r7-payload.tar.gz /tmp/veda-r7-evidence.tar.gz 2>/dev/null || true
+          rm -rf /tmp/veda-r7-work /tmp/veda-r7-transport
+
+      - name: Upload public-safe status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r7-public-status-${{ github.run_id }}
+          path: result-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload researcher-encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r7-encrypted-evidence-${{ github.run_id }}
+          path: result-encrypted/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce proof result after artifact upload
+        if: always()
+        shell: bash
+        run: test "$(cat result-public/RUNNER_EXIT_STATUS.txt 2>/dev/null || echo 99)" = 0
