@@ -1,0 +1,67 @@
+name: internal Veda R16 read-only core state
+
+on:
+  push:
+    branches:
+      - internal/veda-r16-core-public-20260805
+    paths:
+      - ".github/veda_r16_core_probe.py"
+      - ".github/veda-r16-trigger.txt"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: internal-veda-r16-core-public
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout isolated branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Execute pinned read-only state probe
+        id: probe
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python .github/veda_r16_core_probe.py | tee veda-r16-console.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          mkdir -p veda-r16-output
+          printf '%s\n' "$rc" > veda-r16-output/RUNNER_EXIT_STATUS.txt
+          {
+            python --version
+            uname -a
+            sha256sum .github/veda_r16_core_probe.py
+          } > veda-r16-output/ENVIRONMENT.txt
+          (cd veda-r16-output && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          exit "$rc"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r16-core-${{ github.run_id }}
+          path: |
+            veda-r16-output/
+            veda-r16-console.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce completeness after upload
+        if: always()
+        shell: bash
+        run: test "$(cat veda-r16-output/RUNNER_EXIT_STATUS.txt 2>/dev/null || echo 99)" = 0
