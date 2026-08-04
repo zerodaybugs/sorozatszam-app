@@ -1,0 +1,178 @@
+name: internal Veda R16 encrypted macOS gate v2
+
+on:
+  pull_request:
+    branches:
+      - internal/veda-r16-macos-v2-base-20260804
+    paths:
+      - "internal-veda-r16-macos-v2-request/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: internal-veda-r16-macos-v2-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - name: Checkout isolated request
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Generate one-time runner certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p handshake-public
+          openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 1 \
+            -subj '/CN=ephemeral-veda-r16-macos-v2-runner' \
+            -keyout /tmp/veda-r16-v2-runner-private.pem \
+            -out handshake-public/runner-certificate.pem \
+            >/dev/null 2>&1
+          openssl x509 -in handshake-public/runner-certificate.pem -noout -fingerprint -sha256 \
+            > handshake-public/runner-certificate.sha256-fingerprint.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > handshake-public/run-id.txt
+          chmod 600 /tmp/veda-r16-v2-runner-private.pem
+          chmod 644 handshake-public/*
+
+      - name: Publish one-time certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r16-macos-v2-handshake-${{ github.run_id }}
+          path: handshake-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retrieve run-bound encrypted payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/veda-r16-v2-transport
+          mkdir -p /tmp/veda-r16-v2-transport
+          found=0
+          for attempt in $(seq 1 500); do
+            rm -rf /tmp/veda-r16-v2-transport/repo
+            git clone --quiet --depth 1 --branch internal/veda-r16-macos-v2-payload-20260804 \
+              https://github.com/zerodaybugs/sorozatszam-app.git \
+              /tmp/veda-r16-v2-transport/repo 2>/dev/null || true
+            payload_dir=/tmp/veda-r16-v2-transport/repo/internal-veda-r16-macos-v2-payload
+            if [[ -d "$payload_dir" ]]; then
+              shopt -s nullglob
+              parts=("$payload_dir"/payload.cms.b64.part-*)
+              if [[ "${#parts[@]}" -eq 8 ]] \
+                 && [[ -s "$payload_dir/payload.cms.sha256" ]] \
+                 && [[ -s "$payload_dir/run-id.txt" ]] \
+                 && [[ "$(tr -d '\r\n' < "$payload_dir/run-id.txt")" = "$GITHUB_RUN_ID" ]]; then
+                cat "${parts[@]}" > /tmp/veda-r16-v2-transport/payload.cms.b64
+                base64 -D \
+                  -i /tmp/veda-r16-v2-transport/payload.cms.b64 \
+                  -o /tmp/veda-r16-v2-transport/payload.cms
+                expected=$(awk '{print $1}' "$payload_dir/payload.cms.sha256")
+                actual=$(shasum -a 256 /tmp/veda-r16-v2-transport/payload.cms | awk '{print $1}')
+                if [[ "$expected" = "$actual" ]]; then
+                  found=1
+                  break
+                fi
+              fi
+            fi
+            sleep 4
+          done
+          test "$found" -eq 1
+
+      - name: Decrypt, verify, and execute read-only scanner
+        id: scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          rm -rf /tmp/veda-r16-v2-work result-public result-encrypted
+          mkdir -p /tmp/veda-r16-v2-work result-public result-encrypted
+          openssl cms -decrypt -binary -inform DER \
+            -in /tmp/veda-r16-v2-transport/payload.cms \
+            -recip handshake-public/runner-certificate.pem \
+            -inkey /tmp/veda-r16-v2-runner-private.pem \
+            -out /tmp/veda-r16-v2-payload.tar.gz \
+            >/dev/null 2>&1
+          tar -xzf /tmp/veda-r16-v2-payload.tar.gz -C /tmp/veda-r16-v2-work
+          (cd /tmp/veda-r16-v2-work && shasum -a 256 -c INPUT_SHA256SUMS)
+          chmod 0755 /tmp/veda-r16-v2-work/RUN.sh
+          set +e
+          (cd /tmp/veda-r16-v2-work && ./RUN.sh)
+          rc=$?
+          set -e
+          mkdir -p /tmp/veda-r16-v2-work/evidence
+          printf '%s\n' "$rc" > /tmp/veda-r16-v2-work/evidence/RUNNER_EXIT_STATUS.txt
+          printf '%s\n' "$rc" > result-public/RUNNER_EXIT_STATUS.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          evidence = Path('/tmp/veda-r16-v2-work/evidence')
+          status = int(Path('result-public/RUNNER_EXIT_STATUS.txt').read_text().strip())
+          names = sorted(p.name for p in evidence.glob('*') if p.is_file())
+          Path('result-public/PUBLIC_STATUS.json').write_text(json.dumps({
+              'run_id': '${{ github.run_id }}',
+              'runner_exit_status': status,
+              'technical_evidence_file_count': len(names),
+              'machine_state_present': 'R16_CURRENT_STATE.json' in names,
+              'summary_present': 'SUMMARY.md' in names,
+              'public_chain_transactions_signed': 0,
+              'public_chain_transactions_broadcast': 0,
+          }, indent=2, sort_keys=True) + '\n')
+          PY
+          (cd /tmp/veda-r16-v2-work/evidence && \
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS)
+          exit "$rc"
+
+      - name: Encrypt full evidence to researcher certificate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p result-public result-encrypted /tmp/veda-r16-v2-work/evidence
+          if [[ ! -s result-public/RUNNER_EXIT_STATUS.txt ]]; then printf '99\n' > result-public/RUNNER_EXIT_STATUS.txt; fi
+          if [[ -s /tmp/veda-r16-v2-work/researcher-certificate.pem ]]; then
+            tar -czf /tmp/veda-r16-v2-evidence.tar.gz -C /tmp/veda-r16-v2-work evidence
+            openssl cms -encrypt -binary -aes-256-cbc -outform DER \
+              -in /tmp/veda-r16-v2-evidence.tar.gz \
+              -out result-encrypted/evidence.cms \
+              /tmp/veda-r16-v2-work/researcher-certificate.pem >/dev/null 2>&1
+            shasum -a 256 result-encrypted/evidence.cms > result-encrypted/evidence.cms.sha256
+            printf 'encrypted_evidence_complete\n' > result-encrypted/STATUS.txt
+          else
+            printf 'researcher_certificate_unavailable\n' > result-encrypted/STATUS.txt
+          fi
+          cp result-public/RUNNER_EXIT_STATUS.txt result-encrypted/
+          shasum -a 256 result-public/* > result-public/SHA256SUMS 2>/dev/null || true
+          rm -rf /tmp/veda-r16-v2-work /tmp/veda-r16-v2-transport /tmp/veda-r16-v2-payload.tar.gz /tmp/veda-r16-v2-evidence.tar.gz
+          rm -f /tmp/veda-r16-v2-runner-private.pem
+
+      - name: Upload public-safe status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r16-macos-v2-public-status-${{ github.run_id }}
+          path: result-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload researcher-encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r16-macos-v2-encrypted-evidence-${{ github.run_id }}
+          path: result-encrypted/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce scanner result after artifact upload
+        if: always()
+        shell: bash
+        run: test "$(cat result-public/RUNNER_EXIT_STATUS.txt 2>/dev/null || echo 99)" = 0
