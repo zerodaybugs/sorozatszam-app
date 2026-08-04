@@ -1,0 +1,1 @@
+Execute one run-bound encrypted, read-only Veda R16 current-state validation on the macOS hosted runner pool. No vulnerability details, transaction construction, signing, broadcast, or public-chain write. Do not merge.
