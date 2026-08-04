@@ -1,18 +1,17 @@
 name: internal Veda R16 read-only core state
 
 on:
-  push:
+  pull_request:
     branches:
       - internal/veda-r16-core-public-20260805
     paths:
-      - ".github/veda_r16_core_probe.py"
       - ".github/veda-r16-trigger.txt"
 
 permissions:
   contents: read
 
 concurrency:
-  group: internal-veda-r16-core-public
+  group: internal-veda-r16-core-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -20,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout isolated branch
+      - name: Checkout isolated request
         uses: actions/checkout@v4
         with:
           persist-credentials: false
