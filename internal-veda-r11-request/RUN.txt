@@ -1,0 +1,1 @@
+Execute one run-bound encrypted read-only multichain state validation. No signing, broadcast, or production write. Do not merge.
