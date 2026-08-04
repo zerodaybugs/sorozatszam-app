@@ -1,0 +1,184 @@
+name: internal Veda R16 encrypted Windows gate
+
+on:
+  pull_request:
+    branches:
+      - internal/veda-r16-windows-base-20260804
+    paths:
+      - "internal-veda-r16-windows-request/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: internal-veda-r16-windows-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout isolated request
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate one-time runner certificate
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p handshake-public
+          openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 1 \
+            -subj '/CN=ephemeral-veda-r16-windows-runner' \
+            -keyout "$RUNNER_TEMP/veda-r16-runner-private.pem" \
+            -out handshake-public/runner-certificate.pem \
+            >/dev/null 2>&1
+          openssl x509 -in handshake-public/runner-certificate.pem -noout -fingerprint -sha256 \
+            > handshake-public/runner-certificate.sha256-fingerprint.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > handshake-public/run-id.txt
+
+      - name: Publish one-time certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r16-windows-handshake-${{ github.run_id }}
+          path: handshake-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retrieve run-bound encrypted payload
+        run: |
+          set -euo pipefail
+          transport="$RUNNER_TEMP/veda-r16-transport"
+          rm -rf "$transport"
+          mkdir -p "$transport"
+          found=0
+          for attempt in $(seq 1 500); do
+            rm -rf "$transport/repo"
+            git clone --quiet --depth 1 --branch internal/veda-r16-windows-payload-20260804 \
+              https://github.com/zerodaybugs/sorozatszam-app.git "$transport/repo" 2>/dev/null || true
+            payload_dir="$transport/repo/internal-veda-r16-windows-payload"
+            if [[ -d "$payload_dir" ]]; then
+              python - "$payload_dir" "$transport" "$GITHUB_RUN_ID" <<'PY'
+          import base64, hashlib, pathlib, sys
+          payload_dir=pathlib.Path(sys.argv[1]); transport=pathlib.Path(sys.argv[2]); run_id=sys.argv[3]
+          parts=sorted(payload_dir.glob('payload.cms.b64.part-*'))
+          if len(parts)!=8 or not (payload_dir/'payload.cms.sha256').is_file() or not (payload_dir/'run-id.txt').is_file():
+              raise SystemExit(2)
+          if (payload_dir/'run-id.txt').read_text().strip()!=run_id:
+              raise SystemExit(3)
+          raw=base64.b64decode(b''.join(p.read_bytes() for p in parts), validate=True)
+          expected=(payload_dir/'payload.cms.sha256').read_text().split()[0]
+          if hashlib.sha256(raw).hexdigest()!=expected:
+              raise SystemExit(4)
+          (transport/'payload.cms').write_bytes(raw)
+          PY
+              rc=$?
+              if [[ "$rc" -eq 0 ]]; then found=1; break; fi
+            fi
+            sleep 4
+          done
+          test "$found" -eq 1
+
+      - name: Decrypt, verify, and execute read-only scanner
+        id: scan
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/veda-r16-work"
+          transport="$RUNNER_TEMP/veda-r16-transport"
+          rm -rf "$work" result-public result-encrypted
+          mkdir -p "$work" result-public result-encrypted
+          openssl cms -decrypt -binary -inform DER \
+            -in "$transport/payload.cms" \
+            -recip handshake-public/runner-certificate.pem \
+            -inkey "$RUNNER_TEMP/veda-r16-runner-private.pem" \
+            -out "$RUNNER_TEMP/veda-r16-payload.tar.gz" >/dev/null 2>&1
+          tar -xzf "$RUNNER_TEMP/veda-r16-payload.tar.gz" -C "$work"
+          python - "$work" <<'PY'
+          import hashlib, pathlib, sys
+          root=pathlib.Path(sys.argv[1])
+          for line in (root/'INPUT_SHA256SUMS').read_text().splitlines():
+              if not line.strip(): continue
+              digest, rel=line.split(None,1); rel=rel.strip().lstrip('*').lstrip('./')
+              if hashlib.sha256((root/rel).read_bytes()).hexdigest()!=digest:
+                  raise SystemExit(f'hash mismatch: {rel}')
+          PY
+          set +e
+          (cd "$work" && python scanner.py)
+          rc=$?
+          set -e
+          mkdir -p "$work/evidence"
+          printf '%s\n' "$rc" > "$work/evidence/RUNNER_EXIT_STATUS.txt"
+          printf '%s\n' "$rc" > result-public/RUNNER_EXIT_STATUS.txt
+          python - "$work/evidence" result-public "$GITHUB_RUN_ID" <<'PY'
+          import json, pathlib, sys
+          evidence=pathlib.Path(sys.argv[1]); public=pathlib.Path(sys.argv[2]); run_id=sys.argv[3]
+          status=int((public/'RUNNER_EXIT_STATUS.txt').read_text().strip())
+          names=sorted(p.name for p in evidence.glob('*') if p.is_file())
+          (public/'PUBLIC_STATUS.json').write_text(json.dumps({
+              'run_id':run_id,
+              'runner_exit_status':status,
+              'technical_evidence_file_count':len(names),
+              'machine_state_present':'R16_CURRENT_STATE.json' in names,
+              'summary_present':'SUMMARY.md' in names,
+              'public_chain_transactions_signed':0,
+              'public_chain_transactions_broadcast':0,
+          },indent=2,sort_keys=True)+'\n')
+          PY
+          (cd "$work/evidence" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          exit "$rc"
+
+      - name: Encrypt full evidence to researcher certificate
+        if: always()
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/veda-r16-work"
+          mkdir -p result-public result-encrypted "$work/evidence"
+          if [[ ! -s result-public/RUNNER_EXIT_STATUS.txt ]]; then printf '99\n' > result-public/RUNNER_EXIT_STATUS.txt; fi
+          if [[ -s "$work/researcher-certificate.pem" ]]; then
+            tar -czf "$RUNNER_TEMP/veda-r16-evidence.tar.gz" -C "$work" evidence
+            openssl cms -encrypt -binary -aes-256-cbc -outform DER \
+              -in "$RUNNER_TEMP/veda-r16-evidence.tar.gz" \
+              -out result-encrypted/evidence.cms \
+              "$work/researcher-certificate.pem" >/dev/null 2>&1
+            sha256sum result-encrypted/evidence.cms > result-encrypted/evidence.cms.sha256
+            printf 'encrypted_evidence_complete\n' > result-encrypted/STATUS.txt
+          else
+            printf 'researcher_certificate_unavailable\n' > result-encrypted/STATUS.txt
+          fi
+          cp result-public/RUNNER_EXIT_STATUS.txt result-encrypted/
+          sha256sum result-public/* > result-public/SHA256SUMS 2>/dev/null || true
+          rm -rf "$work" "$RUNNER_TEMP/veda-r16-transport" "$RUNNER_TEMP/veda-r16-payload.tar.gz" "$RUNNER_TEMP/veda-r16-evidence.tar.gz"
+          rm -f "$RUNNER_TEMP/veda-r16-runner-private.pem"
+
+      - name: Upload public-safe status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r16-windows-public-status-${{ github.run_id }}
+          path: result-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload researcher-encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-r16-windows-encrypted-evidence-${{ github.run_id }}
+          path: result-encrypted/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce scanner result after artifact upload
+        if: always()
+        run: test "$(cat result-public/RUNNER_EXIT_STATUS.txt 2>/dev/null || echo 99)" = 0
