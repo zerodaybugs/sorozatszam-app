@@ -1,1 +1,1 @@
-Execute one run-bound encrypted, read-only Veda Ethereum/Scroll current-rate validation. No vulnerability source, credentials, signer, transaction construction, or public-chain write is included in this request. Do not merge.
+Execute one run-bound encrypted, read-only Veda multichain Accountant-rate validation across all known deployed chain families. No vulnerability source, credentials, signer, transaction construction, or public-chain write is included in this request. Do not merge.
