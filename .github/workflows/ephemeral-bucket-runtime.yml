@@ -1,0 +1,135 @@
+name: Ephemeral encrypted Bucket runtime
+
+on:
+  pull_request:
+    branches: [bucket-runtime-base-20260805]
+    paths: ['.github/workflows/ephemeral-bucket-runtime.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Generate one-time input certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/in /tmp/out public_metadata
+          openssl req -x509 -newkey rsa:4096 -nodes -sha256 -days 1 \
+            -subj "/CN=ephemeral-bucket-${GITHUB_RUN_ID}" \
+            -keyout /tmp/in/key.pem -out /tmp/in/cert.pem >/dev/null 2>&1
+          cp /tmp/in/cert.pem public_metadata/input_certificate.pem
+          openssl x509 -in /tmp/in/cert.pem -noout -fingerprint -sha256 -subject -dates \
+            > public_metadata/INPUT_CERTIFICATE_METADATA.txt
+
+      - name: Upload one-time input certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-input-${{ github.run_id }}
+          path: public_metadata/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Wait for encrypted payload
+        id: inbox
+        shell: bash
+        env:
+          BRANCH: ${{ github.head_ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prefix=".tooling/bucket-runtime-${GITHUB_RUN_ID}"
+          ref='refs/remotes/payload/head'
+          found=false
+          for _ in $(seq 1 1440); do
+            git fetch --quiet --no-tags --depth=1 "https://github.com/${REPOSITORY}.git" \
+              "+refs/heads/${BRANCH}:${ref}" >/dev/null 2>&1 || true
+            if git show "${ref}:${prefix}/READY" >/tmp/in/READY 2>/dev/null; then
+              mapfile -t parts < <(git ls-tree -r --name-only "$ref" -- "$prefix" | grep -E '/part-[0-9]{4}$' | sort)
+              if test "${#parts[@]}" -gt 0; then
+                : >/tmp/in/payload.b64
+                for part in "${parts[@]}"; do git show "${ref}:${part}" >>/tmp/in/payload.b64; done
+                base64 -d /tmp/in/payload.b64 >/tmp/in/payload.cms
+                expected="$(tr -d '[:space:]' </tmp/in/READY)"
+                actual="$(sha256sum /tmp/in/payload.cms | awk '{print $1}')"
+                if test -s /tmp/in/payload.cms && test "$actual" = "$expected"; then found=true; break; fi
+              fi
+            fi
+            sleep 5
+          done
+          test "$found" = true
+          echo 'received=true' >>"$GITHUB_OUTPUT"
+
+      - name: Decrypt and execute
+        id: private
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          umask 077
+          mkdir -p /tmp/payload /tmp/result /tmp/payload/results
+          openssl cms -decrypt -binary -inform DER -in /tmp/in/payload.cms \
+            -recip /tmp/in/cert.pem -inkey /tmp/in/key.pem -out /tmp/in/payload.tar >/dev/null 2>&1
+          python3 - <<'PY'
+          import pathlib, tarfile
+          src=pathlib.Path('/tmp/in/payload.tar'); dst=pathlib.Path('/tmp/payload')
+          with tarfile.open(src,'r:*') as tf:
+              ms=tf.getmembers()
+              if not ms: raise SystemExit('empty payload')
+              for m in ms:
+                  p=pathlib.PurePosixPath(m.name)
+                  if p.is_absolute() or '..' in p.parts or m.issym() or m.islnk() or m.isdev():
+                      raise SystemExit('unsafe payload')
+              tf.extractall(dst,members=ms,filter='data')
+          PY
+          (cd /tmp/payload && sha256sum -c MANIFEST.sha256 >/tmp/result/PAYLOAD_INTEGRITY.log)
+          chmod 700 /tmp/payload/run.sh
+          (cd /tmp/payload && env PRIVATE_RUNNER_RESULTS=/tmp/payload/results bash ./run.sh) \
+            >/tmp/result/PRIVATE_RUN.log 2>&1
+          status=$?
+          printf '%s\n' "$status" >/tmp/result/PRIVATE_RUN_STATUS.txt
+          echo "status=$status" >>"$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Encrypt private result
+        if: always() && steps.inbox.outputs.received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/result/bundle
+          cp -a /tmp/result/*.log /tmp/result/*.txt /tmp/result/bundle/ 2>/dev/null || true
+          cp -a /tmp/payload/results/. /tmp/result/bundle/ 2>/dev/null || true
+          (cd /tmp/result/bundle && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS.txt)
+          tar -cf /tmp/result/result.tar -C /tmp/result/bundle .
+          openssl cms -encrypt -binary -aes256 -in /tmp/result/result.tar -outform DER \
+            -out /tmp/result/encrypted-result.cms /tmp/payload/result_cert.pem >/dev/null 2>&1
+          sha256sum /tmp/result/encrypted-result.cms >/tmp/result/ENCRYPTED_RESULT_SHA256.txt
+          rm -rf /tmp/payload /tmp/in /tmp/result/result.tar /tmp/result/bundle
+
+      - name: Upload encrypted result
+        if: always() && steps.inbox.outputs.received == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-result-${{ github.run_id }}
+          path: |
+            /tmp/result/encrypted-result.cms
+            /tmp/result/ENCRYPTED_RESULT_SHA256.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Enforce result
+        if: always() && steps.inbox.outputs.received == 'true'
+        shell: bash
+        env:
+          STATUS: ${{ steps.private.outputs.status }}
+        run: test "$STATUS" = '0'
