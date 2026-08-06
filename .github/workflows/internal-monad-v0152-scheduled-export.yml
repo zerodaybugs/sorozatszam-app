@@ -1,0 +1,241 @@
+name: internal Monad v0.15.2 one-shot scheduled export
+
+on:
+  schedule:
+    - cron: '50 23 6 8 *'
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: internal-monad-v0152-one-shot-export
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  MONAD_BFT_COMMIT: 6373056bfa14318d2a6d7a371cc43c636bf0aab6
+  RUST_TOOLCHAIN: 1.91.1
+  LOCATOR_ISSUE: '22'
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Publish start locator
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/${LOCATOR_ISSUE}/comments" \
+            -f body="MONAD_SCHEDULED_EXPORT_RUN_ID=${GITHUB_RUN_ID}\nstate=started\nPublic-source-only environment export."
+
+      - name: Initialize evidence and diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence export cargo-cache-root
+          printf '%s\n' "$MONAD_BFT_COMMIT" > evidence/MONAD_BFT_COMMIT.txt
+          printf '%s\n' "$RUST_TOOLCHAIN" > evidence/RUST_TOOLCHAIN.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > evidence/GITHUB_RUN_ID.txt
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            id
+            df -h
+            free -h
+            git --version
+            rustup --version
+          } | tee evidence/RUNNER.txt
+
+      - name: Checkout pinned public Monad source
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: category-labs/monad-bft
+          ref: 6373056bfa14318d2a6d7a371cc43c636bf0aab6
+          path: monad-bft
+          submodules: recursive
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify source and install exact Rust toolchain
+        id: setup
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          actual="$(git -C monad-bft rev-parse HEAD)"
+          printf '%s\n' "$actual" | tee evidence/ACTUAL_MONAD_BFT_COMMIT.txt
+          test "$actual" = "$MONAD_BFT_COMMIT"
+          git -C monad-bft submodule status --recursive | tee evidence/SUBMODULES.txt
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup override set "$RUST_TOOLCHAIN" --path monad-bft
+          rustc +"$RUST_TOOLCHAIN" --version --verbose | tee evidence/RUSTC_VERSION.txt
+          cargo +"$RUST_TOOLCHAIN" --version --verbose | tee evidence/CARGO_VERSION.txt
+
+      - name: Populate exact dependency cache and compile public consensus tests
+        id: build
+        if: steps.setup.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          set +e
+          cargo +"$RUST_TOOLCHAIN" fetch \
+            --manifest-path monad-bft/Cargo.toml \
+            --locked 2>&1 | tee evidence/CARGO_FETCH.log
+          fetch_rc=${PIPESTATUS[0]}
+          printf '%s\n' "$fetch_rc" > evidence/CARGO_FETCH_RC.txt
+
+          cargo +"$RUST_TOOLCHAIN" test \
+            --manifest-path monad-bft/Cargo.toml \
+            -p monad-consensus \
+            --no-run \
+            --locked 2>&1 | tee evidence/CONSENSUS_COMPILE.log
+          compile_rc=${PIPESTATUS[0]}
+          printf '%s\n' "$compile_rc" > evidence/CONSENSUS_COMPILE_RC.txt
+          set -e
+          test "$fetch_rc" = 0
+          test "$compile_rc" = 0
+
+      - name: Build portable public archives
+        id: package
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          command -v zstd >/dev/null 2>&1 || {
+            sudo apt-get update && sudo apt-get install -y zstd
+          }
+          printf '%s\n' "$?" > evidence/ZSTD_SETUP_RC.txt
+
+          if rustup which --toolchain "$RUST_TOOLCHAIN" rustc >/dev/null 2>&1; then
+            TOOLCHAIN_RUSTC="$(rustup which --toolchain "$RUST_TOOLCHAIN" rustc)"
+            TOOLCHAIN_DIR="$(dirname "$(dirname "$TOOLCHAIN_RUSTC")")"
+            printf '%s\n' "$TOOLCHAIN_DIR" > evidence/ORIGINAL_TOOLCHAIN_DIR.txt
+            tar --zstd -cf export/rust-toolchain-1.91.1-x86_64-unknown-linux-gnu.tar.zst \
+              -C "$(dirname "$TOOLCHAIN_DIR")" "$(basename "$TOOLCHAIN_DIR")"
+            printf '%s\n' "$?" > evidence/TOOLCHAIN_ARCHIVE_RC.txt
+          else
+            printf '%s\n' 127 > evidence/TOOLCHAIN_ARCHIVE_RC.txt
+          fi
+
+          if test -d "$HOME/.cargo/registry"; then
+            cp -a "$HOME/.cargo/registry" cargo-cache-root/registry
+          fi
+          if test -d "$HOME/.cargo/git"; then
+            cp -a "$HOME/.cargo/git" cargo-cache-root/git
+          fi
+          tar --zstd -cf export/cargo-cache-v0152.tar.zst -C cargo-cache-root .
+          printf '%s\n' "$?" > evidence/CARGO_CACHE_ARCHIVE_RC.txt
+
+          if test -d monad-bft; then
+            tar --zstd --exclude='.git' --exclude='target' \
+              -cf export/monad-bft-v0152-source.tar.zst -C monad-bft .
+            printf '%s\n' "$?" > evidence/SOURCE_ARCHIVE_RC.txt
+          else
+            printf '%s\n' 127 > evidence/SOURCE_ARCHIVE_RC.txt
+          fi
+
+          if test -d monad-bft/target; then
+            tar --zstd -cf export/monad-bft-v0152-target.tar.zst \
+              -C monad-bft target
+            printf '%s\n' "$?" > evidence/TARGET_ARCHIVE_RC.txt
+          else
+            printf '%s\n' 127 > evidence/TARGET_ARCHIVE_RC.txt
+          fi
+
+          (cd export && sha256sum * > SHA256SUMS.txt) 2>/dev/null
+          (cd evidence && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          du -h export/* evidence/* 2>/dev/null | tee evidence/ARCHIVE_SIZES.txt
+          exit 0
+
+      - name: Upload Rust toolchain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0152-rust-toolchain-${{ github.run_id }}
+          path: export/rust-toolchain-1.91.1-x86_64-unknown-linux-gnu.tar.zst
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload Cargo dependency cache
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0152-cargo-cache-${{ github.run_id }}
+          path: export/cargo-cache-v0152.tar.zst
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload exact public source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0152-source-${{ github.run_id }}
+          path: export/monad-bft-v0152-source.tar.zst
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload compiled target cache
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0152-target-${{ github.run_id }}
+          path: export/monad-bft-v0152-target.tar.zst
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload manifests and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0152-build-manifests-${{ github.run_id }}
+          path: |
+            export/SHA256SUMS.txt
+            evidence/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Publish final locator
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          SETUP_OUTCOME: ${{ steps.setup.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          body="MONAD_SCHEDULED_EXPORT_RUN_ID=${GITHUB_RUN_ID}\nstate=finished\ncheckout=${CHECKOUT_OUTCOME} setup=${SETUP_OUTCOME} build=${BUILD_OUTCOME} package=${PACKAGE_OUTCOME}\nArtifacts expire after 3 days."
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/${LOCATOR_ISSUE}/comments" \
+            -f body="$body"
+
+      - name: Enforce build gate
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.checkout.outcome }}" = success
+          test "${{ steps.setup.outcome }}" = success
+          test "${{ steps.build.outcome }}" = success
+          test -f export/rust-toolchain-1.91.1-x86_64-unknown-linux-gnu.tar.zst
+          test -f export/cargo-cache-v0152.tar.zst
+          test -f export/monad-bft-v0152-source.tar.zst
+          test -f export/monad-bft-v0152-target.tar.zst
