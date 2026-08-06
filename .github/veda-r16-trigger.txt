@@ -1,1 +1,1 @@
-Execute one isolated read-only Veda R16 current-state probe. No signing, broadcast, impersonation, or state mutation. Do not merge.
+Execute one public-source-only Monad v0.15.2 build-environment export through the previously approved runner path. No vulnerability details or private PoC logic. Do not merge.
