@@ -1,0 +1,44 @@
+name: internal Monad v0.15.2 export dispatcher
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  dispatch:
+    if: >-
+      github.event.issue.pull_request &&
+      github.actor == 'zerodaybugs' &&
+      github.event.comment.body == '/monad-v0152-dispatch-20260806-b9e2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Dispatch public-source-only export
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh workflow run internal-monad-v0152-export-dispatched.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f issue_number="$ISSUE_NUMBER"
+
+      - name: Confirm dispatch request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body='MONAD_EXPORT_DISPATCH=accepted; the dispatched run will publish its run ID when the runner starts.'
