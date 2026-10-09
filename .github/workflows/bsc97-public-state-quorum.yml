@@ -1,0 +1,163 @@
+name: Temporary BSC97 public-state quorum
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/bsc97-public-state-quorum.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture public read-only state from independent RPCs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p snapshot
+
+          RPC_CANDIDATES=(
+            'https://bsc-testnet-rpc.publicnode.com'
+            'https://data-seed-prebsc-1-s1.bnbchain.org:8545'
+            'https://data-seed-prebsc-2-s1.bnbchain.org:8545'
+            'https://bsc-testnet.public.blastapi.io'
+            'https://bsc-testnet.drpc.org'
+          )
+
+          rpc_raw() {
+            local url="$1" method="$2" params="$3"
+            curl --fail --silent --show-error --max-time 15 \
+              -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+              "$url"
+          }
+
+          WORKING=()
+          for url in "${RPC_CANDIDATES[@]}"; do
+            chain="$(rpc_raw "$url" eth_chainId '[]' 2>/dev/null | jq -r '.result // empty' || true)"
+            if [[ "$chain" == '0x61' ]]; then
+              WORKING+=("$url")
+            fi
+            if [[ ${#WORKING[@]} -ge 2 ]]; then break; fi
+          done
+          if [[ ${#WORKING[@]} -lt 1 ]]; then
+            echo 'No BSC testnet RPC available' >&2
+            exit 1
+          fi
+
+          TCGV='0xba9e4d6b0b8c3bb13b28a3b3a2f09012674ed5c0'
+          NEXUS='0xb11426b649404ef2df7f8f7acf3de3aa00e3ed60'
+          BUY='0x3d5c49910f32ed78dc83141fabf1033d7b5e52e2'
+          STAKING='0x8d2478b2901036a4a0f88c4dfe6b6075e02d197a'
+          BASIC='0xe901ec321c5aa78f080bf99cc31e7b83c7a0fd0d'
+          FOUNDER='0xb8a75c065556c95f7ce86eaefdce849afa8e6324'
+          LAUNCH='0x411db8fa3638976b6802e76bb0789014eed4c1e9'
+          WRAPPER='0xfdc1b93a80b56efd66dda8c82f1f5f70f3fa1178'
+          TCGR='0xd9be1afabdcc07faed8f64d9dbfe56459085bb0d'
+          CONVERTER='0xe150b30181d455c8a47a27dbebb1de41ec6d8d97'
+          USDC='0xc6ace01ffc5b8925d5f4c2d427481f8612b4ca1b'
+          PAIR='0xe7ebfbf0cadad62b03935b87ddf4bf570e9594e5'
+
+          pad_address() { printf '%064s' "${1#0x}" | tr ' ' '0'; }
+          selector_call() {
+            local url="$1" address="$2" data="$3"
+            rpc_raw "$url" eth_call "[{\"to\":\"$address\",\"data\":\"$data\"},\"latest\"]" | jq -r '.result // ("ERROR:" + (.error.message // "unknown"))'
+          }
+
+          for idx in "${!WORKING[@]}"; do
+            url="${WORKING[$idx]}"
+            out="snapshot/rpc-$((idx+1)).tsv"
+            block="$(rpc_raw "$url" eth_blockNumber '[]' | jq -r '.result')"
+            {
+              printf 'key\tvalue\n'
+              printf 'metadata.rpc\t%s\n' "$url"
+              printf 'metadata.block\t%s\n' "$block"
+              printf 'metadata.timestampUtc\t%s\n' "$(date -u +%FT%TZ)"
+            } > "$out"
+
+            call() { printf '%s\t%s\n' "$1" "$(selector_call "$url" "$2" "$3")" >> "$out"; }
+            code() {
+              local result
+              result="$(rpc_raw "$url" eth_getCode "[\"$2\",\"latest\"]" | jq -r '.result // empty')"
+              printf 'code.%s\t%s\n' "$1" "$result" >> "$out"
+            }
+
+            for entry in \
+              "TCGV:$TCGV" "NEXUS:$NEXUS" "BUY:$BUY" "STAKING:$STAKING" \
+              "BASIC:$BASIC" "FOUNDER:$FOUNDER" "LAUNCH:$LAUNCH" "WRAPPER:$WRAPPER" \
+              "TCGR:$TCGR" "CONVERTER:$CONVERTER" "USDC:$USDC" "PAIR:$PAIR"; do
+              code "${entry%%:*}" "${entry#*:}"
+            done
+
+            call USDC.decimals "$USDC" 0x313ce567
+            call TCGV.totalSupply "$TCGV" 0x18160ddd
+            call TCGV.stakingVault "$TCGV" 0x24e7964a
+            call TCGV.buyRouter "$TCGV" 0xd2435d2d
+            call TCGV.initialLaunch "$TCGV" 0xbbaa49da
+            call TCGV.presaleActive "$TCGV" 0x53135ca0
+            call TCGV.supplyRecomputed "$TCGV" 0x2d97bbfe
+            call TCGV.isPair.PAIR "$TCGV" "0xe5e31b13$(pad_address "$PAIR")"
+            call TCGV.isExcluded.STAKING "$TCGV" "0x3a98ef39$(pad_address "$STAKING")"
+            call TCGV.isExcluded.BUY "$TCGV" "0x3a98ef39$(pad_address "$BUY")"
+            call TCGV.balance.PAIR "$TCGV" "0x70a08231$(pad_address "$PAIR")"
+            call TCGV.balance.CONVERTER "$TCGV" "0x70a08231$(pad_address "$CONVERTER")"
+            call TCGV.balance.STAKING "$TCGV" "0x70a08231$(pad_address "$STAKING")"
+            call USDC.balance.PAIR "$USDC" "0x70a08231$(pad_address "$PAIR")"
+            call USDC.balance.BUY "$USDC" "0x70a08231$(pad_address "$BUY")"
+            call PAIR.token0 "$PAIR" 0x0dfe1681
+            call PAIR.token1 "$PAIR" 0xd21220a7
+            call PAIR.getReserves "$PAIR" 0x0902f1ac
+            call PAIR.totalSupply "$PAIR" 0x18160ddd
+            call STAKING.totalAssets "$STAKING" 0x01e1d114
+            call STAKING.totalSupply "$STAKING" 0x18160ddd
+            call STAKING.requiredStake "$STAKING" 0x3137451b
+            call STAKING.pricingRouter "$STAKING" 0xd5e6cc26
+            call STAKING.pricingUsdc "$STAKING" 0xbd644909
+            call STAKING.twapAnchor "$STAKING" 0xadf836fd
+            call BASIC.totalSupply "$BASIC" 0x18160ddd
+            call BASIC.totalMinted "$BASIC" 0xa2309ff8
+            call FOUNDER.soldCount "$FOUNDER" 0x39f9c82c
+            call FOUNDER.wave2Start "$FOUNDER" 0x34ded88d
+            call LAUNCH.totalAllocated "$LAUNCH" 0xcd369b51
+            call LAUNCH.tge "$LAUNCH" 0xa4317ef4
+            call TCGR.totalSupply "$TCGR" 0x18160ddd
+            call TCGR.qualifyingNft "$TCGR" 0xfc9e8f2a
+            call TCGR.converter "$TCGR" 0xbd38837b
+            call NEXUS.totalSupply "$NEXUS" 0x18160ddd
+            call CONVERTER.ratio "$CONVERTER" 0x71ca337d
+
+            sha256sum "$out" > "$out.sha256"
+          done
+
+          python3 - <<'PY'
+          import json, pathlib
+          files=sorted(pathlib.Path('snapshot').glob('rpc-*.tsv'))
+          snapshots=[]
+          for path in files:
+              rows={}
+              for line in path.read_text().splitlines()[1:]:
+                  k,v=line.split('\t',1); rows[k]=v
+              snapshots.append(rows)
+          keys=sorted(set().union(*(s.keys() for s in snapshots)))
+          disagreements={k:[s.get(k) for s in snapshots] for k in keys if len({s.get(k) for s in snapshots})>1 and not k.startswith('metadata.')}
+          activation_keys=['TCGV.totalSupply','PAIR.getReserves','PAIR.totalSupply','STAKING.totalAssets','STAKING.totalSupply','TCGV.balance.CONVERTER','TCGR.totalSupply','NEXUS.totalSupply','LAUNCH.totalAllocated','TCGR.qualifyingNft','TCGV.stakingVault','TCGV.isPair.PAIR']
+          result={'schema':'bsc97-public-state-quorum/v1','rpc_count':len(snapshots),'snapshots':snapshots,'disagreements':disagreements,'activation':{k:[s.get(k) for s in snapshots] for k in activation_keys}}
+          pathlib.Path('snapshot/quorum.json').write_text(json.dumps(result,indent=2))
+          print(json.dumps(result['activation'],indent=2))
+          print('DISAGREEMENTS',json.dumps(disagreements,indent=2))
+          PY
+
+      - name: Upload snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsc97-public-state-quorum
+          path: snapshot/
+          if-no-files-found: error
+          retention-days: 1
