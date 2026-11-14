@@ -1,0 +1,23 @@
+name: Temporary Encrypted Fixture Export
+
+on:
+  push:
+    paths:
+      - '.github/workflows/_temporary-fixture-export-20261114.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-fixture-export-${{ github.run_id }}
+          path: ci/fixture/fixture.b64
+          if-no-files-found: error
+          retention-days: 1
