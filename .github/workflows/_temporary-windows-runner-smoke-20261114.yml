@@ -1,0 +1,22 @@
+name: Temporary Windows Runner Smoke
+
+on:
+  push:
+    paths:
+      - '.github/workflows/_temporary-windows-runner-smoke-20261114.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Runner baseline
+        shell: pwsh
+        run: |
+          Write-Host "WINDOWS_RUNNER_OK"
+          [Environment]::OSVersion.VersionString
+          Get-Date -AsUTC -Format o
