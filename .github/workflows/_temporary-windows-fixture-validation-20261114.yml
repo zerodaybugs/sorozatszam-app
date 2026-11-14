@@ -1,0 +1,100 @@
+name: Temporary Windows Fixture Validation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/_temporary-windows-fixture-validation-20261114.yml'
+      - 'ci/fixture/fixture.b64'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install current SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+
+      - name: Execute encrypted fixture
+        shell: pwsh
+        env:
+          FIXTURE_KEY: ${{ secrets.ZDB_FIXTURE_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $work = Join-Path $env:RUNNER_TEMP 'fixture-validation'
+          $src = Join-Path $work 'src'
+          $result = Join-Path $work 'result'
+          New-Item -ItemType Directory -Path $src,$result -Force | Out-Null
+
+          if ([string]::IsNullOrWhiteSpace($env:FIXTURE_KEY)) {
+            Write-Host 'FIXTURE_KEY_MISSING'
+            exit 1
+          }
+
+          $openssl = (Get-Command openssl.exe -ErrorAction SilentlyContinue).Source
+          if (-not $openssl) {
+            $candidate = 'C:\Program Files\Git\usr\bin\openssl.exe'
+            if (Test-Path $candidate) { $openssl = $candidate }
+          }
+          if (-not $openssl) {
+            Write-Host 'OPENSSL_MISSING'
+            exit 1
+          }
+
+          $base64 = (Get-Content 'ci/fixture/fixture.b64' -Raw) -replace '\s',''
+          [IO.File]::WriteAllBytes((Join-Path $work 'fixture.enc'), [Convert]::FromBase64String($base64))
+
+          & $openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 `
+            -in (Join-Path $work 'fixture.enc') `
+            -out (Join-Path $work 'fixture.zip') `
+            -pass env:FIXTURE_KEY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'FIXTURE_DECRYPT_FAILED'
+            exit 1
+          }
+
+          Expand-Archive -Path (Join-Path $work 'fixture.zip') -DestinationPath $src -Force
+
+          $executionLog = Join-Path $result 'execution.log'
+          & pwsh -NoProfile -NonInteractive -File (Join-Path $src 'run.ps1') *> $executionLog
+          $fixtureExit = $LASTEXITCODE
+          "FIXTURE_EXIT=$fixtureExit" | Set-Content (Join-Path $result 'status.txt') -Encoding ascii
+
+          $fixtureEvidence = Join-Path $src 'evidence'
+          if (Test-Path $fixtureEvidence) {
+            Copy-Item $fixtureEvidence (Join-Path $result 'evidence') -Recurse -Force
+          }
+
+          Compress-Archive -Path (Join-Path $result '*') -DestinationPath (Join-Path $work 'result.zip') -Force
+          & $openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 `
+            -in (Join-Path $work 'result.zip') `
+            -out (Join-Path $work 'result.enc') `
+            -pass env:FIXTURE_KEY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'RESULT_ENCRYPT_FAILED'
+            exit 1
+          }
+
+          Copy-Item (Join-Path $work 'result.enc') (Join-Path $env:GITHUB_WORKSPACE 'fixture-result.enc') -Force
+          Write-Host 'FIXTURE_COMPLETED'
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-windows-fixture-${{ github.run_id }}
+          path: fixture-result.enc
+          if-no-files-found: error
+          retention-days: 3
